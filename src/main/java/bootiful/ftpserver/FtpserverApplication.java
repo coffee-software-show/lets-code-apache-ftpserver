@@ -5,52 +5,72 @@ import org.apache.ftpserver.FtpServer;
 import org.apache.ftpserver.FtpServerFactory;
 import org.apache.ftpserver.ftplet.*;
 import org.apache.ftpserver.listener.ListenerFactory;
-import org.apache.ftpserver.usermanager.ClearTextPasswordEncryptor;
-import org.apache.ftpserver.usermanager.PropertiesUserManagerFactory;
 import org.apache.ftpserver.usermanager.UsernamePasswordAuthentication;
-import org.apache.ftpserver.usermanager.impl.ConcurrentLoginPermission;
-import org.apache.ftpserver.usermanager.impl.TransferRatePermission;
-import org.apache.ftpserver.usermanager.impl.WritePermission;
+import org.apache.ftpserver.usermanager.impl.*;
+import org.apache.mina.transport.socket.nio.NioProcessor;
+import org.springframework.aot.hint.MemberCategory;
+import org.springframework.aot.hint.RuntimeHints;
+import org.springframework.aot.hint.RuntimeHintsRegistrar;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.ImportRuntimeHints;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.util.Assert;
+import org.springframework.util.unit.DataSize;
 
 import java.io.File;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Predicate;
 
 @SpringBootApplication
+@ImportRuntimeHints(FtpserverApplication.Hints.class)
+@EnableConfigurationProperties(FtpserverApplication.FtpProperties.class)
 public class FtpserverApplication {
+
+    @ConfigurationProperties("ftp")
+    record FtpProperties(File root, Duration idleTime, int concurrentUsers, DataSize rate) {
+    }
+
+    static class Hints implements RuntimeHintsRegistrar {
+
+        @Override
+        public void registerHints(RuntimeHints hints, ClassLoader classLoader) {
+            Set.of(NioProcessor.class).forEach(s -> hints.reflection().registerType(s, MemberCategory.values()));
+            hints.resources().registerResource(new ClassPathResource("org/apache/ftpserver/message/FtpStatus.properties"));
+        }
+    }
 
     public static void main(String[] args) {
         SpringApplication.run(FtpserverApplication.class, args);
     }
 
-    static UserManager propertiesUserManager() {
-        PropertiesUserManagerFactory userManagerFactory = new PropertiesUserManagerFactory();
-        userManagerFactory.setFile(new File("/Users/jlong/Downloads/ftpserver/src/main/resources/users.properties"));
-        userManagerFactory.setPasswordEncryptor(new ClearTextPasswordEncryptor());
-        UserManager userManager = userManagerFactory.createUserManager();
-        return userManager;
-    }
+    @Bean
+    UserManager defaultUserManager(FtpProperties properties) throws Exception {
+        var udm = new DefaultUserManager(properties.root());
 
-
-    static UserManager defaultUserManager() {
-        return new DefaultUserManager(ROOT);
+        for (var userName : Set.of("jlong", "jhoeller", "mbhave")) {
+            var user = new DefaultUser(properties.root(), userName, "pw", true,
+                    properties.concurrentUsers(),
+                    properties.rate.toBytes(),
+                    (int) properties.idleTime().toSeconds());
+            udm.save(user);
+        }
+        return udm;
     }
 
     @Bean
-    ApplicationRunner ftpService() {
+    ApplicationRunner ftpService(UserManager userManager) {
         return args -> {
             FtpServerFactory serverFactory = new FtpServerFactory();
             ListenerFactory factory = new ListenerFactory();
-            UserManager userManager = defaultUserManager();
-            initUsers(userManager);
+
             serverFactory.setUserManager(userManager);
             serverFactory.addListener("default", factory.createListener());
             FtpServer server = serverFactory.createServer();
@@ -58,15 +78,7 @@ public class FtpserverApplication {
         };
     }
 
-    private static File ROOT = new File("/Users/jlong/Desktop/root");
 
-    private static void initUsers(UserManager userManager) throws Exception {
-
-        for (var userName : Set.of("jlong", "jhoeller", "mbhave")) {
-            var user = new DefaultUser(ROOT, userName, "pw", true);
-            userManager.save(user);
-        }
-    }
 }
 
 @Slf4j
@@ -75,17 +87,17 @@ class DefaultUser implements User {
     private final String username, password;
     private final boolean enabled;
     private final File home;
+    private final long rateInBytes;
+    private final int concurrentLogins;
+    private final int idleTimeInSeconds;
 
-    /**
-     * Copy constructor.
-     */
-    public DefaultUser(File home, User user) {
-        this(home, user.getName(), user.getPassword(), user.getEnabled());
-    }
-
-    public DefaultUser(File home, String username, String password, boolean enabled) {
+    public DefaultUser(File home, String username, String password, boolean enabled, int concurrentLogins, long rateInBytes,
+                       int idleTimeInSeconds) {
         this.username = username;
+        this.idleTimeInSeconds = idleTimeInSeconds;
+        this.concurrentLogins = concurrentLogins;
         this.password = password;
+        this.rateInBytes = rateInBytes;
         this.enabled = enabled;
         this.home = new File(home, username);
         log.debug("the home directory should be " + this.home.getAbsolutePath());
@@ -105,42 +117,35 @@ class DefaultUser implements User {
 
     @Override
     public List<? extends Authority> getAuthorities() {
-        var rate = 1000 * 1000 * 1000 * 10;
-        var authorityList = List.of(new WritePermission(), new ConcurrentLoginPermission(10, 10),
+        var rate = (int) this.rateInBytes;
+        var authorityList = List.of(new WritePermission(), new ConcurrentLoginPermission(this.concurrentLogins, this.concurrentLogins),
                 new TransferRatePermission(rate, rate));
         return authorityList;
     }
 
     @Override
     public List<? extends Authority> getAuthorities(Class<? extends Authority> clazz) {
-        var authorities = getAuthorities(); // .stream().filter(a -> a.getClass().isAssignableFrom(clazz)).toList();
-        return authorities;
+        var auths = getAuthorities().stream().filter(au -> au.getClass().isAssignableFrom(clazz)).toList();
+        log.info("have the following authentications for [" + auths +
+                 "] : " + clazz.getName());
+        return auths;
     }
 
-    static AuthorizationRequest find(Predicate<Authority> filter, List<? extends Authority> authorities, AuthorizationRequest request) {
-        var authority = authorities.stream().filter(filter).findAny().orElse(null);
-        return null != authority ? request : null;
-    }
 
     @Override
     public AuthorizationRequest authorize(AuthorizationRequest request) {
-        return request;
-/*
-        var authorities = this.getAuthorities();
-
-        if (request instanceof WriteRequest wr)
-            return authorities.stream().filter(au -> au instanceof WritePermission).findFirst().map(wp -> request).orElse(null);
-
-        return  List .of(find(au -> au instanceof WritePermission, authorities, request),
-                find(au -> au instanceof TransferRatePermission, authorities, request),
-                find(au -> au instanceof ConcurrentLoginPermission, authorities, request))
-                .stream().filter(au -> au != null).findAny().orElse(null);*/
-
+        if (request instanceof ConcurrentLoginRequest)
+            return getAuthorities(ConcurrentLoginPermission.class).isEmpty() ? null : request;
+        if (request instanceof TransferRateRequest)
+            return getAuthorities(TransferRatePermission.class).isEmpty() ? null : request;
+        if (request instanceof WriteRequest)
+            return getAuthorities(WritePermission.class).isEmpty() ? null : request;
+        return null;
     }
 
     @Override
     public int getMaxIdleTime() {
-        return 60_000;
+        return this.idleTimeInSeconds;
     }
 
     @Override
@@ -150,7 +155,7 @@ class DefaultUser implements User {
 
     @Override
     public String getHomeDirectory() {
-        return  this.home.getAbsolutePath();
+        return this.home.getAbsolutePath();
     }
 }
 
